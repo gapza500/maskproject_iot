@@ -19,3 +19,5 @@ This layout separates **stable app code** under `apps/.../prod/` from **active d
 
 ## CI
 CI compiles all sketches on PRs. Pin library versions there to avoid surprises.
+
+หงส์มาเยือน
