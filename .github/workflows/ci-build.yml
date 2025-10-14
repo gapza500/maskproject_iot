@@ -1,0 +1,28 @@
+
+name: Arduino CI (prod + dev + labs)
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-all:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v1
+      - name: Setup cores & libs
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          # Pin lib versions here if needed, e.g.:
+          # arduino-cli lib install "Sensirion I2C SEN6x@1.0.3" "Adafruit MAX1704X@1.3.0"
+      - name: Compile sketches
+        shell: bash
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          for ino in firmware/apps/**/**/**/*.ino firmware/labs/**/*.ino firmware/modules/**/examples/**/**/*.ino; do
+            sketch_dir=$(dirname "$ino")
+            echo "Compiling $sketch_dir"
+            arduino-cli compile --fqbn esp32:esp32:esp32c6 "$sketch_dir"
+          done

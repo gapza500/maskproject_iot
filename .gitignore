@@ -1,0 +1,26 @@
+
+# Arduino
+*.hex
+*.elf
+*.bin
+*.eep
+*.map
+*.out
+*.d
+.build/
+.build-*/*
+/**/.vscode/.browse.VC.db*
+/**/.vscode/ipch
+
+# PlatformIO
+.pio/
+.clang_complete
+gcc-arm-none-eabi-*
+
+# Node/Python
+node_modules/
+__pycache__/
+
+# Secrets
+arduino_secrets.h
+.env
