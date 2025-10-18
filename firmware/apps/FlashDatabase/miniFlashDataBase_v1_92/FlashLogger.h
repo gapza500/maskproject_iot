@@ -1,0 +1,360 @@
+#ifndef FLASH_LOGGER_H
+#define FLASH_LOGGER_H
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RTClib.h>
+
+// ---- Flash geometry ----
+#define PAGE_SIZE     256
+#define SECTOR_SIZE   4096
+#define MAX_SECTORS   2048   // 8MB / 4KB
+
+// ---- SPI commands (Winbond W25Qxx) ----
+#define CMD_READ      0x03
+#define CMD_PP        0x02
+#define CMD_WREN      0x06
+#define CMD_SE        0x20
+
+// ---- Sector header (v1.8 adds generation) ----
+struct SectorHeader {
+  uint32_t magic;       // 'LOGG' = 0x4C4F4747
+  uint16_t dayID;       // days since 2000-01-01
+  uint8_t  pushed;      // 0 = not pushed, 1 = pushed
+  uint8_t  reserved;    // padding
+  uint32_t generation;  // boot/generation id when this sector started
+};
+
+// ---- RAM index for quick lookups ----
+struct SectorIndex {
+  bool     present;   // header found
+  uint16_t dayID;
+  bool     pushed;
+  uint32_t writePtr;  // absolute next-write address inside this sector
+};
+
+// ---- Factory info (binary, in last sector) ----
+struct FactoryInfo {
+  uint32_t magic;            // 'FACT' = 0x46414354
+  char     model[24];        // e.g. "AirMonitor C6"
+  char     flashModel[16];   // e.g. "W25Q64JV"
+  char     deviceId[16];     // 12 digits + '\0'
+  uint16_t firstDayID;       // dayID when first set
+  uint8_t  defaultDateStyle; // 1=TH,2=ISO,3=US
+  uint8_t  reserved0;
+  uint32_t totalEraseOps;
+
+  // v1.8 wear-leveling & quarantine
+  uint32_t bootCounter;      // increments each begin()
+  uint16_t startHint;        // round-robin day start sector hint
+  uint16_t badCount;         // number of quarantined sectors
+  uint16_t badList[16];      // up to 16 bad sectors
+
+  uint8_t  reserved[28];     // keep struct compact for future
+};
+
+// ---- Flash stats for UI ----
+struct FlashStats {
+  float totalMB;
+  float usedMB;
+  float freeMB;
+  float usedPercent;
+  float healthPercent;
+  uint16_t estimatedDaysLeft;
+};
+
+enum DateStyle : uint8_t {
+  DATE_THAI = 1,   // DD/MM/YY
+  DATE_ISO  = 2,   // YYYY-MM-DD
+  DATE_US   = 3    // MM/DD/YY
+};
+
+// ---- v1.7+ record header + commit marker ----
+struct __attribute__((packed)) RecordHeader {
+  uint16_t len;   // payload length (no header/commit)
+  uint16_t crc;   // CRC16 over payload (Modbus/A001)
+  uint32_t ts;    // seconds since 2000-01-01 (RTClib secondstime)
+  uint32_t seq;   // monotonic sequence
+  uint8_t  flags; // reserved
+  uint8_t  rsv;   // reserved
+};
+static constexpr uint8_t REC_COMMIT = 0xA5;
+
+// --- Summaries for ls/cd shell ---
+struct DaySummary {
+  uint16_t dayID;
+  uint16_t sectors;
+  uint32_t bytes;
+  bool     pushed;
+  uint32_t firstTs;
+  uint32_t lastTs;
+};
+
+struct SectorSummary {
+  int      sector;
+  uint16_t dayID;
+  uint32_t bytes;
+  bool     pushed;
+  uint32_t firstTs;
+  uint32_t lastTs;
+};
+
+// --- Navigation state for shell ---
+enum SelKind { SEL_NONE, SEL_DAY, SEL_SECTOR };
+
+// ==== v1.92: Query engine & formats ====
+enum OutFmt { OUT_JSONL = 0, OUT_CSV = 1 };
+
+struct QuerySpec {
+  // time filters
+  uint32_t ts_from = 0;            // inclusive (seconds since 2000-01-01)
+  uint32_t ts_to   = 0xFFFFFFFF;   // inclusive
+  uint16_t day_from = 0;           // optional (if set, overrides ts_*)
+  uint16_t day_to   = 0;
+
+  // field filter (OR of keys; nullptr-terminated)
+  const char* includeKeys[8] = { nullptr }; // e.g. {"bat","temp",nullptr}
+
+  // limits / sampling
+  uint32_t max_records = 0;        // 0 = no limit
+  uint16_t sample_every = 1;       // 1 = every record
+
+  // output
+  OutFmt out = OUT_JSONL;
+  bool compact_json = true;        // for JSONL (ignored for CSV)
+};
+
+// Row callback signature
+typedef void (*RowCallback)(const char* line, void* user);
+
+// ==== v1.93: Sync cursors & export ====
+struct SyncCursor {
+  uint16_t dayID;     // day of next record to read
+  int      sector;    // absolute sector index of next record
+  uint32_t addr;      // absolute flash address of next record (points to RecordHeader)
+  uint32_t seq_next;  // next expected sequence (monotonic writer seq)
+};
+
+class FlashLogger {
+public:
+  explicit FlashLogger(uint8_t csPin);
+
+  // Init (RTC must be rtc.begin()'d). Also loads/creates Factory Info.
+  bool begin(RTC_DS3231* rtc);
+
+  // Append JSON record (auto-add '\n', crash-safe, CRC'd)
+  bool append(const String& json);
+
+  // Pretty print grouped by day with selected date style (CRC/commit enforced)
+  void printFormattedLogs();
+
+  // Raw continuous dump (valid records only)
+  void readAll();
+
+  // Mark a day (all its sectors) as "pushed"
+  void markDayPushed(uint16_t dayID);
+  void markCurrentDayPushed();
+
+  // Safe GC: erase only when pushed && older than 7 days
+  void gc();
+
+  // Date style: 1=Thai, 2=ISO, 3=US
+  void setDateStyle(uint8_t style);
+
+  // ---- Factory info API ----
+  bool setFactoryInfo(const String& model, const String& flashModel, const String& deviceID);
+  void printFactoryInfo();
+  bool factoryReset(const String& code12); // keep factory info, wipe everything else
+
+  // ---- Stats / lifetime for UI ----
+  FlashStats getFlashStats(float avgBytesPerDay);
+  float getFreeSpaceMB();
+  float getUsedSpaceMB();
+  float getUsedPercent();
+  float getFlashHealth(); // based on totalEraseOps / (MAX_SECTORS * 100000)
+  uint16_t estimateDaysRemaining(float avgBytesPerDay);
+
+  // ---- Back-pressure (optional daily cap) ----
+  void setMaxDailyBytes(uint32_t bytes); // 0 = unlimited
+  bool isLowSpace() const;
+
+  // v1.91 navigation/query-lite
+  void    buildSummaries();                        // rebuild cached lists
+  void    listDays();                              // "ls"
+  void    listSectors(uint16_t dayID);             // "ls sectors [dayID]"
+  bool    selectDay(uint16_t dayID);               // "cd day …"
+  bool    selectSector(int sector);                // "cd sector …"
+  void    printSelected();                         // "print" (day or sector)
+  void    printSelectedInfo();                     // "info"
+
+  // CLI helper (call from loop): returns true if command recognized
+  bool    handleCommand(const String& cmd, Stream& io);
+
+  // helpers for date/day resolving
+  static  bool parseDateYYYYMMDD(const String& s, uint16_t& outDayID);
+  void    formatDayID(uint16_t dayID, char* out, size_t outLen) const;
+
+  // expose last caches for UI if needed
+  int     lastDayCount() const { return _dayCount; }
+  int     lastSectorCount() const { return _sectCount; }
+  bool    dayIndexToDayID(int idx, uint16_t& out) const;   // 0-based
+  bool    sectorIndexToSector(int idx, int& out) const;    // 0-based
+
+    // v1.92 output format controls
+  void   setOutputFormat(OutFmt f);                 // JSONL (default) or CSV
+  void   setCsvColumns(const char* cols_csv);       // e.g. "ts,bat,temp"
+  const char* getCsvColumns() const { return _csvCols; }
+
+  // v1.92 query API
+  uint32_t queryLogs(const QuerySpec& q, RowCallback onRow, void* user);
+  uint32_t queryLatest(uint32_t N, RowCallback onRow, void* user);
+  uint32_t queryRange(uint32_t ts_from, uint32_t ts_to, RowCallback onRow, void* user);
+  uint32_t queryBattery(RowCallback onRow, void* user); // convenience
+
+  // CLI additions (keep one-line handler in loop)
+  // recognized:
+  //   q latest <N> [keys...]
+  //   q day <YYYY-MM-DD> [keys...]
+  //   q range <YYYY-MM-DD>..<YYYY-MM-DD> [keys...]
+  //   fmt csv|jsonl
+  //   set csv <cols>             (e.g. set csv ts,bat,temp)
+  bool   handleQueryCommand(const String& cmd, Stream& io); // called by handleCommand()
+
+  //1.93
+  // Save/load cursor (opaque to client code)
+  bool    getCursor(SyncCursor& out) const;      // current writer position (for “bookmark now”)
+  bool    setCursor(const SyncCursor& in);       // set reader/export start position (validates)
+  void    clearCursor();                         // reset to earliest valid record
+
+  // Export since cursor (streams rows to callback)
+  // Returns rows emitted; stops when max_rows reached (0 = unlimited)
+  uint32_t exportSince(const SyncCursor& from, uint32_t max_rows,
+                       RowCallback onRow, void* user);
+
+  // Mark all days <= dayID as pushed (for GC)
+  void    markDaysPushedUntil(uint16_t dayID_inclusive);
+
+  // CLI helpers (add to handleCommand)
+  //  cursor show
+  //  cursor clear
+  //  cursor set <dayID> <sector> <addr> <seq>
+  //  export <max_rows>              (uses internal _readCursor)
+  bool    handleCursorCommand(const String& cmd, Stream& io);
+
+
+private:
+  // HW & state
+  RTC_DS3231* _rtc = nullptr;
+  uint8_t     _cs;
+  uint16_t    _currentDay   = 0;
+  int         _currentSector = -1;
+  uint32_t    _writeAddr     = 0;
+  DateStyle   _dateStyle     = DATE_THAI;
+  uint32_t    _seqCounter    = 0;   // monotonic sequence
+  uint32_t    _generation    = 0;   // boot/generation ID
+
+  // Daily cap
+  uint32_t    _maxDailyBytes = 0;   // 0 = unlimited
+  uint32_t    _todayBytes     = 0;
+  bool        _lowSpace       = false;
+
+  // RAM index per sector
+  SectorIndex _index[MAX_SECTORS];
+
+  // Factory storage (last sector)
+  FactoryInfo _factory {};
+  static constexpr int FACTORY_SECTOR = MAX_SECTORS - 1;
+
+  // Low-level flash
+  void writeEnable();
+  void readData(uint32_t addr, uint8_t* buf, uint16_t len);
+  void pageProgram(uint32_t addr, const uint8_t* buf, uint32_t len); // chunk-safe
+  void sectorErase(uint32_t addr, bool countErase = true);
+
+  // Sector/header helpers
+  static uint32_t sectorBaseAddr(int sector) { return (uint32_t)sector * SECTOR_SIZE; }
+  bool   readSectorHeader(int sector, SectorHeader& hdr);
+  void   writeSectorHeader(int sector, uint16_t dayID, bool pushed);
+  bool   sectorIsEmpty(int sector);
+  void   scanAllSectorsBuildIndex();
+  void   selectOrCreateTodaySector();
+  void   findLastWritePositionInSector(int sector); // header-aware
+  bool   sectorHasSpace(int sector, uint32_t needBytes);
+  bool   moveToNextSectorSameDay();
+
+  // Wear-leveling & quarantine
+  bool   isBadSector(int sector) const;
+  void   quarantineSector(int sector);
+  int    nextRoundRobinStart();
+
+  // Verify ops
+  bool   verifyErase(uint32_t base);
+  bool   verifyWrite(uint32_t addr, const uint8_t* buf, uint32_t len);
+
+  // Factory info helpers
+  bool loadFactoryInfo();
+  void saveFactoryInfo();
+  static uint16_t dayIDFromDateTime(const DateTime& t);
+
+  // Time helpers
+  static bool isOlderThanNDays(uint16_t baseDay, uint16_t targetDay, uint16_t n);
+
+  // Printing helpers
+  void formatDate(const DateTime& dt, char* out, size_t outLen) const;
+  void printSectorData(int sector); // CRC/commit aware
+
+  // Capacity helpers
+  uint32_t countUsedSectors() const;
+
+  // CRC16 helper
+  static uint16_t crc16(const uint8_t* data, uint32_t len, uint16_t seed = 0xFFFF);
+
+  // Cached summaries (rebuilt by buildSummaries)
+  static constexpr int MAX_DAYS_CACHE  = 366;
+  static constexpr int MAX_SECT_CACHE  = 64;
+
+  DaySummary    _days[MAX_DAYS_CACHE];
+  int           _dayCount = 0;
+
+  SectorSummary _sects[MAX_SECT_CACHE];
+  int           _sectCount = 0;
+
+  // Selection
+  SelKind       _selKind = SEL_NONE;
+  uint16_t      _selDay  = 0;
+  int           _selSector = -1;
+
+  // Internal helpers
+  void      summarizeDay(uint16_t dayID, DaySummary& out);
+  void      summarizeSector(int sector, SectorSummary& out);
+  uint32_t  computeValidBytesInSector(int sector, uint32_t& firstTs, uint32_t& lastTs);
+  static    int cmpDayDesc(const void* a, const void* b); // sort newest-first
+
+  // v1.92 format state
+  OutFmt  _outFmt = OUT_JSONL;
+  char    _csvCols[48] = "ts,bat";  // default CSV columns
+
+  // v1.92 helpers
+  static bool recordMatchesTime(uint16_t recDay, uint32_t ts, const QuerySpec& q);
+  bool   emitRecord(uint16_t recDay, uint32_t ts, const uint8_t* payload, uint16_t len,
+                    const QuerySpec& q, RowCallback onRow, void* user);
+  bool   jsonExtractKeyValue(const char* json, const char* key, String& outVal) const; // number/string
+  void   buildCsvLine(uint32_t ts, const char* payload, uint16_t len, const char* cols, String& out);
+  void   buildJsonFiltered(const char* payload, uint16_t len, const char* const* keys, bool compact, String& out);
+
+  // v1.93: persistent read cursor (kept only in RAM by default)
+  SyncCursor _readCursor{0, -1, 0, 0};
+
+  // helpers
+  bool    findFirstRecord(int sector, uint32_t& outAddr);
+  bool    findNextRecordAddr(int sector, uint32_t curAddr, uint32_t& nextAddr);
+  bool    readRecordMeta(uint32_t addr, RecordHeader& rh, uint16_t& recDay) const;
+  bool    isValidRecordAt(uint32_t addr) const;
+  bool    advanceToNextValid(SyncCursor& c) const;  // mutate to next valid record
+  bool    earliestCursor(SyncCursor& out) const;    // first record in flash
+
+  void reinitAfterFactoryReset();
+
+};
+
+#endif
