@@ -1,0 +1,10 @@
+/**
+ * @dir examples
+ *
+ * @brief Contains all of the example sketches
+ */
+/**
+ * @page page_the_examples
+ * @m_innerpage{example_read_write_register}
+ * @m_innerpage{example_scan_registers}
+ */
